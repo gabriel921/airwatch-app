@@ -7,7 +7,7 @@ AirWatch pulls live air quality readings for 12 cities worldwide from the [OpenA
 **Live API:** `https://airwatch-func-gabriel-e8bjg6f0f5a7cbf4.swedencentral-01.azurewebsites.net/api/air-quality`
 *(optionally filter with `?city=London`)*
 
-**Live dashboard:** *link coming soon*
+**Live dashboard:** https://app.powerbi.com/view?r=eyJrIjoiYTIyZGZlMDctYmQ2Ny00M2JkLWI2OTAtMGY5MGJjN2Y1YTY1IiwidCI6IjYzMjIxMWEwLWUxY2MtNGI3YS1iNWU4LTUyZjY1ODA0NDZiNSJ9
 
 ## What it does
 
