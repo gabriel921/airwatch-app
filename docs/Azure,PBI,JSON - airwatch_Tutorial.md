@@ -3,11 +3,11 @@
 A step-by-step tutorial for building a real-time air quality monitoring pipeline using OpenAQ, Azure Functions, Azure SQL Database, and Power BI — entirely on free-tier Azure services.
 
 **What you'll build:**
-- A Python Azure Function that pulls live air quality data every 30 minutes
+- A Python Azure Function that pulls live air quality data once a day
 - An Azure SQL Database storing that data
 - A second Python Azure Function exposing the data as a JSON API
 - A Power BI dashboard published to the web as a live demo
-- Everything deployed via GitHub Actions, running continuously at $0/month
+- Everything running continuously at $0/month (GitHub Actions is optional, not required)
 
 **Stack decisions made for this build:**
 - Language: Python (for both Azure Functions)
@@ -674,6 +674,186 @@ After fixing both, a clean wipe-and-rerun produced correct data across all 10 li
 
 ---
 
+## Step 10: Deploy the Ingestion Function to Azure
+
+So far everything has run locally via Azurite. Now we create the real cloud home for it.
+
+1. Portal → search **"Function App"** → Create.
+2. **Hosting plan**: Flex Consumption (the newer serverless plan; has a generous permanent free monthly grant).
+3. **Resource group**: `airwatch-rg`. **Name**: something globally unique, e.g. `airwatch-func-yourname`. **Runtime stack**: Python, version matching your local venv (e.g. 3.13). **Region**: same as your database. **OS**: Linux.
+4. Instance size: default (e.g. 2048 MB) is fine — our workload is light and stays far under the free compute grant regardless.
+5. Zone redundancy: **off** (adds cost, unnecessary for a portfolio project).
+6. Let it auto-create a Storage Account on the Storage tab (defaults are fine) — this is required for the timer trigger to track its schedule, and is itself covered by a separate free tier.
+7. Create. Takes a minute or two.
+
+**Enable Managed Identity and grant database access:**
+1. Function App → **Identidade** (Identity) → System assigned → On → Save. Note the Object ID it gives you.
+2. In the SQL Query Editor for `airwatch-db`, run (replacing with your actual Function App name):
+   ```sql
+   CREATE USER [airwatch-func-yourname] FROM EXTERNAL PROVIDER;
+   ALTER ROLE db_datareader ADD MEMBER [airwatch-func-yourname];
+   ALTER ROLE db_datawriter ADD MEMBER [airwatch-func-yourname];
+   ```
+
+**Set app settings** (the cloud equivalent of `local.settings.json`, which never gets deployed):
+Function App → **Configuração**/**Variáveis de ambiente** → add:
+- `OPENAQ_API_KEY`
+- `SQL_SERVER` (e.g. `airwatch-server-yourname.database.windows.net`)
+- `SQL_DATABASE` (`airwatch-db`)
+
+**Deploy the code:**
+1. Install the **Azure Functions** extension in VS Code, sign in to Azure from it.
+2. Open your project folder as the active workspace (File → Open Folder).
+3. Azure panel → right-click your Function App → **Deploy to Function App...** → select your project folder → confirm the overwrite.
+
+## Step 11: Fix the ODBC driver problem (Linux Function Apps)
+
+The first deployment will likely fail with an error like:
+```
+pyodbc.Error: [unixODBC][Driver Manager] Can't open lib 'ODBC Driver 17 for SQL Server' : file not found
+```
+This is a known gap: Azure's Linux Python Functions runtime doesn't ship the Microsoft ODBC driver that `pyodbc` needs, and the Flex Consumption plan doesn't support custom containers (which would otherwise let you install it yourself).
+
+**Fix: switch from `pyodbc` to Microsoft's `mssql-python` package**, which bundles its own driver binaries directly in the pip install — no system-level driver needed.
+
+`requirements.txt`:
+```
+azure-functions
+mssql-python
+requests
+```
+
+`function_app.py` — replace the whole `get_db_connection()` function with:
+```python
+import mssql_python
+
+def get_db_connection():
+    server = os.environ["SQL_SERVER"]
+    database = os.environ["SQL_DATABASE"]
+    conn_str = (
+        f"Server={server};"
+        f"Database={database};"
+        f"Authentication=ActiveDirectoryDefault;"
+        f"Encrypt=yes;"
+    )
+    return mssql_python.connect(conn_str)
+```
+`ActiveDirectoryDefault` uses the same credential-chain logic as `DefaultAzureCredential` — it authenticates via `az login` locally and via Managed Identity once deployed, with no code branching between the two. Remove the now-unused `pyodbc`, `struct`, and `azure-identity` imports. Redeploy.
+
+## Step 12: Build and Deploy the API Function
+
+Add a second function to the same `function_app.py`, alongside `ingest_air_quality`:
+
+```python
+@app.route(route="air-quality", auth_level=func.AuthLevel.ANONYMOUS)
+def get_air_quality(req: func.HttpRequest) -> func.HttpResponse:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    city_filter = req.params.get("city")
+
+    if city_filter:
+        cursor.execute(
+            "SELECT city, parameter, reading_date, avg_value, unit, reading_count FROM daily_averages WHERE city = ? ORDER BY reading_date DESC",
+            city_filter
+        )
+    else:
+        cursor.execute(
+            "SELECT city, parameter, reading_date, avg_value, unit, reading_count FROM daily_averages ORDER BY city, parameter, reading_date DESC"
+        )
+
+    columns = [col[0] for col in cursor.description]
+    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    for row in rows:
+        if hasattr(row["reading_date"], "isoformat"):
+            row["reading_date"] = row["reading_date"].isoformat()
+
+    cursor.close()
+    conn.close()
+
+    return func.HttpResponse(
+        json.dumps(rows, default=str),
+        mimetype="application/json",
+        status_code=200
+    )
+```
+`auth_level=ANONYMOUS` means no API key is needed to call it — reasonable for public, non-sensitive air quality data. `?city=London` optionally filters.
+
+Redeploy the same way as before. Your Function App's real public hostname includes a unique suffix Azure assigns (check **Descrição Geral** on the Function App for the exact URL) — it won't be the plain `<name>.azurewebsites.net` you might expect. The live endpoint is:
+```
+https://<your-actual-hostname>/api/air-quality
+```
+
+## Step 13: Avoiding a Real Cost Incident
+
+This is worth doing proactively, not after the fact. A 30-minute ingestion schedule has a hidden problem: Azure SQL Serverless auto-pauses after ~1 hour of no activity, which is what keeps it free. A query every 30 minutes never lets it go idle long enough to pause — so it runs continuously, and can burn through the whole month's free compute allowance (100,000 vCore-seconds) in about a week.
+
+**Fixes to apply before leaving this running unattended:**
+
+1. **Daily ingestion schedule**, not every 30 minutes:
+   ```python
+   @app.timer_trigger(schedule="0 0 0 * * *", arg_name="mytimer", run_on_startup=False)
+   ```
+2. **Quiet the verbose Azure SDK logging** (every token request was logging full HTTP headers, which quietly ate into Application Insights' own separate free ingestion allowance):
+   ```python
+   logging.getLogger("azure").setLevel(logging.WARNING)
+   ```
+   Add this once, near the top of `function_app.py`.
+3. **Set an Application Insights daily cap** as a hard backstop: the purple Application Insights resource → **Uso e custos estimados** → Daily cap → e.g. `0.05` GB/day. Once hit, it drops further telemetry instead of ever billing you.
+4. **Actually create a budget alert** (and verify it saved): Cost Management + Billing → Orçamentos → + Criar → scope your subscription, amount €1–2/month, alert conditions at 80% and 100% of actual spend, your email. Confirm it appears back in the Orçamentos list afterward — the save can silently fail if you don't click all the way through.
+
+If the database does exhaust its free allowance and auto-pauses (configured behavior, costs €0 for that itself), it resumes automatically on the 1st of the next month, or you can create a second free database (Azure allows up to 10 per subscription) to reset the clock immediately by re-running your `CREATE TABLE`/`CREATE VIEW` scripts against it.
+
+## Step 14: Build the Power BI Report
+
+1. Install Power BI Desktop (Microsoft Store, free).
+2. **Power BI's cloud service requires a work/school-style email** — personal Gmail/Hotmail/Outlook.com addresses are blocked at sign-in. If you don't have one, create a free one inside your own Azure subscription's existing Entra ID tenant: Portal → Microsoft Entra ID → Utilizadores → + Novo utilizador → pick a username, Azure gives you `you@<random>.onmicrosoft.com` for free. Sign into Power BI with that.
+3. It'll ask you to activate a **Fabric (Free)** license — accept it, genuinely free, may ask for phone verification only (no card).
+4. **Obter dados → Web → Básico** → paste your live `/api/air-quality` URL → **Anónimo** → Conectar.
+5. The result loads as a single "Record" column — click its expand icon (⇄), check all 6 fields, OK.
+6. Fix `avg_value`'s type: right-click the column → **Alterar Tipo → Usando a Localidade...** → Número Decimal, locale **Inglês (Estados Unidos)** (the JSON uses a dot as the decimal separator; your Power BI locale may expect a comma, causing plain type conversion to error).
+7. For any date field that auto-expands into a Year/Quarter/Month/Day hierarchy in a chart, click the field pill's dropdown and pick the plain date field instead of the hierarchy — otherwise line charts collapse into single points per year.
+8. **Fechar e Aplicar.**
+
+Build out visuals (slicer on `city`, bar/line charts on `avg_value` set to **Média** not **Soma**, filtered to a single `parameter` where relevant, a card for a headline number, a table for the raw rows). Style via the paint-roller **Formatar** pane on each visual (fonts, borders, titles) — select multiple visuals at once with Ctrl-click to format them together.
+
+Save as `AirWatch.pbix`.
+
+## Step 15: Publish to the Web
+
+1. **Base** ribbon → **Publicar** → choose "O meu espaço de trabalho" → wait for upload → open the link.
+2. In the browser (Power BI service), with the report open: **Ficheiro → Publicar na Web**.
+3. If you hit *"Contacte o seu administrador para ativar a criação de código incorporado"* — this is a tenant setting that needs enabling, and since it's your own tenant, you can do it yourself:
+   - Portal → Microsoft Entra ID → Funções e administradores → **Administrador Global** → + Adicionar atribuições → add your work account.
+   - app.powerbi.com → gear icon → Portal de administração → Definições do inquilino → find **Publicar na Web** → Ativado → "Toda a organização" → Aplicar.
+   - This can take several minutes to propagate. Retry "Publicar na Web" after waiting.
+4. Confirm the public-sharing dialog, copy the generated link.
+
+**Important limitation**: this published link does **not** auto-refresh. Power BI's scheduled refresh requires a Pro license (or Fabric capacity), not available on the free tier used here. To update it with new data, repeat: open `AirWatch.pbix` → Atualizar → Guardar → Publicar (the same report updates in place; it doesn't create a new link).
+
+## Step 16: Push to GitHub
+
+1. Clean up: delete any backup/scratch files you don't want public, move one-off debugging scripts into a `tools/` folder.
+2. Check `.gitignore` includes at minimum: `local.settings.json`, `.venv/`, `__pycache__/`, the Azurite artifact files (`__azurite_db*__.json`, `__blobstorage__/`, `__queuestorage__/`, `AzuriteConfig`).
+3. Create an empty public repo on GitHub (no auto-generated README — write your own).
+4. ```
+   git init
+   git add .
+   git status
+   ```
+   **Check the output carefully** — `local.settings.json` and `.venv` must not appear. If either does, stop and fix `.gitignore` before continuing.
+5. ```
+   git commit -m "Initial commit"
+   git branch -M main
+   git remote add origin https://github.com/<your-username>/<repo-name>.git
+   git push -u origin main
+   ```
+6. Write a `README.md` covering: what the project does, the architecture, the live API and dashboard links, the stack, and — genuinely worth including — the real problems hit and fixed along the way (dead OpenAQ stations, the ODBC driver gap, the cost incident). That last part is good portfolio material; it shows real debugging rather than tutorial-following.
+7. On the repo's GitHub page, click the gear icon next to **"About"** in the sidebar to add a description, the live link, and topic tags.
+
+---
+
 ## Progress Checkpoint (for resuming in a new conversation)
 
 **Done so far:**
@@ -695,15 +875,14 @@ After fixing both, a clean wipe-and-rerun produced correct data across all 10 li
 - Power BI report built locally against a static `sample-air-quality.json` (same schema as the live API) while the database was paused: city slicer, PM2.5-by-city bar chart, daily-average-by-pollutant line chart, headline card, and a full data table — styled (titles, axis labels, fonts, borders) and saved as `docs/AirWatch.pbix`
 - Project cleaned and pushed to GitHub (public repo, working `.gitignore`, dev/debug scripts moved to `tools/`)
 
-**Still to do (in order):**
-1. Wait for the SQL free-tier monthly reset (~Oct 1) or create a second free database to reset the compute allowance immediately; once available, manually trigger `ingest_air_quality` once to repopulate
-2. In Power BI, swap the Web data source from the local sample JSON to the live API URL; refresh, re-save `AirWatch.pbix`
-3. Publish the Power BI report to web (note: the "Publish to web" tenant setting may need enabling by the tenant admin; scheduled auto-refresh on the free license is unconfirmed — manual refresh + republish is the reliable fallback)
-4. Write and commit the public-facing `README.md` (architecture, live endpoint, screenshots, setup instructions)
-5. Optional: GitHub Actions for automatic deployment
-6. Final end-to-end test + share the live link
+- SQL free-tier reset confirmed on schedule (Oct 1); ingestion re-verified working end to end (17 readings/10 cities) after the reset
+- Power BI swapped from the local sample JSON to the live API (edited the "Origem" step's formula to `Json.Document(Web.Contents("..."))`, set the web source's privacy level to Público); report rebuilt and re-saved as `AirWatch.pbix`
+- Published to web successfully (required granting the work account Global Administrator and enabling "Publicar na Web" in tenant settings — see Step 15); confirmed scheduled auto-refresh is NOT available on the free license, manual refresh + republish is the permanent way to update it
+- `README.md` written and pushed to GitHub alongside this tutorial
 
-**To resume**: start a new conversation, attach this tutorial file, and say you're continuing AirWatch from the "pushed to GitHub, waiting on the SQL free-tier reset before finishing Power BI" checkpoint.
+**PROJECT COMPLETE.** Everything in this tutorial, steps 1 through 16, reflects the actual finished build: a daily-ingesting Azure Function, a public JSON API, and a published Power BI dashboard, all on free-tier Azure services.
+
+**To resume** (e.g. for a rebuild, a new environment, or helping someone else follow this): start a new conversation, attach this tutorial file, and say which step you're picking up from.
 
 ---
 
@@ -716,8 +895,8 @@ Once the project is fully built and working, you have two paths. Pick whichever 
 1. In the Azure Portal, search **"Subscriptions"** → select your Free Trial subscription.
 2. Click **"Upgrade"** (Portuguese: "Atualizar").
 3. Follow the prompts to convert to **Pay-As-You-Go**. This asks for a payment method, but as covered above, you are not charged unless you exceed the free monthly quotas — which this project's usage sits far below.
-4. After upgrading, your resources keep running exactly as before, just without the 30-day ceiling. The €1 budget alert from earlier keeps watching in the background regardless.
-5. Nothing else changes — your Function, database, and Power BI dashboard keep working uninterrupted.
+4. After upgrading, your resources keep running exactly as before, just without the 30-day ceiling. The budget alert from earlier keeps watching in the background regardless.
+5. The ingestion Function and API keep running and updating automatically. The published Power BI dashboard does **not** — upgrading to PAYG doesn't unlock scheduled refresh (that needs Power BI Pro specifically, a separate cost). Keeping the dashboard current means manually repeating Atualizar → Guardar → Publicar in Power BI Desktop whenever you want it to show fresh data.
 
 ### Option B: You're done experimenting, and want to fully stop it (no upgrade needed)
 
